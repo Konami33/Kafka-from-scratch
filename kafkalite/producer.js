@@ -1,26 +1,22 @@
-// producer.js — Lab 2
+// producer.js — Lab 3
 'use strict';
 
 const net = require('net');
 
+const topic = process.argv[2] || 'orders';
+const messageCount = parseInt(process.argv[3]) || 3;
+
 const client = net.connect({ port: 9092 }, () => {
-  console.log('[PRODUCER] Connected to broker');
+  console.log(`[PRODUCER] Publishing ${messageCount} messages to topic "${topic}"`);
 
-  const topic = 'orders';
-  const messages = [
-    { orderId: 1, item: 'Widget A', qty: 5 },
-    { orderId: 2, item: 'Widget B', qty: 2 },
-    { orderId: 3, item: 'Widget C', qty: 10 },
-  ];
-
-  messages.forEach((value, i) => {
+  for (let i = 0; i < messageCount; i++) {
     setTimeout(() => {
-      console.log('[PRODUCER] Publishing:', value);
+      const value = { id: i + 1, topic, data: `Message ${i + 1}`, ts: Date.now() };
       client.write(JSON.stringify({ cmd: 'PUBLISH', topic, value }) + '\n');
-    }, i * 500);
-  });
+    }, i * 300);
+  }
 
-  setTimeout(() => client.end(), messages.length * 500 + 200);
+  setTimeout(() => client.end(), messageCount * 300 + 200);
 });
 
 let buffer = '';
@@ -30,7 +26,7 @@ client.on('data', (chunk) => {
   while ((idx = buffer.indexOf('\n')) !== -1) {
     const raw = buffer.slice(0, idx).trim();
     buffer = buffer.slice(idx + 1);
-    if (raw) console.log('[PRODUCER] Broker ack:', JSON.parse(raw));
+    if (raw) console.log('[PRODUCER] Ack:', JSON.parse(raw));
   }
 });
 

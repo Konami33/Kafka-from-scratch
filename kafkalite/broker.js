@@ -1,11 +1,10 @@
-// broker.js — Lab 2: Pull-based producer/consumer
+// broker.js — Lab 3: Multi-topic routing
 'use strict';
 
 const net = require('net');
-
 const PORT = 9092;
 
-// In-memory log: { topicName: [record, record, ...] }
+// { topicName: [record, ...] }
 const topics = {};
 
 const server = net.createServer((socket) => {
@@ -29,13 +28,8 @@ const server = net.createServer((socket) => {
     }
   });
 
-  socket.on('end', () => {
-    console.log(`[BROKER] Client disconnected: ${clientId}`);
-  });
-
-  socket.on('error', (err) => {
-    console.error(`[BROKER] Error [${clientId}]: ${err.message}`);
-  });
+  socket.on('end', () => console.log(`[BROKER] Client disconnected: ${clientId}`));
+  socket.on('error', (err) => console.error(`[BROKER] Error [${clientId}]: ${err.message}`));
 });
 
 function ensureTopic(name) {
@@ -53,7 +47,6 @@ function handleMessage(socket, msg) {
       if (!topic || value === undefined) {
         return sendTo(socket, { status: 'error', message: 'PUBLISH requires topic and value' });
       }
-
       ensureTopic(topic);
 
       const record = {
@@ -62,29 +55,31 @@ function handleMessage(socket, msg) {
         value,
         timestamp: Date.now(),
       };
-
       topics[topic].push(record);
-      console.log(`[BROKER] PUBLISH -> topic="${topic}" offset=${record.offset}`);
-
-      // No fan-out. No subscriber list. Just return the offset.
+      console.log(`[BROKER] PUBLISH -> "${topic}" [offset ${record.offset}]`);
       sendTo(socket, { status: 'ok', offset: record.offset, topic });
       break;
     }
 
     case 'FETCH': {
-      // Consumer asks: "Give me messages from offset N onwards"
       const { topic, fromOffset = 0, maxRecords = 100 } = msg;
       if (!topic) {
         return sendTo(socket, { status: 'error', message: 'FETCH requires topic' });
       }
-
       ensureTopic(topic);
-
       const records = topics[topic]
         .filter(r => r.offset >= fromOffset)
         .slice(0, maxRecords);
-
       sendTo(socket, { status: 'ok', topic, records, count: records.length });
+      break;
+    }
+
+    case 'LIST_TOPICS': {
+      const topicInfo = Object.keys(topics).map(name => ({
+        name,
+        messageCount: topics[name].length,
+      }));
+      sendTo(socket, { status: 'ok', topics: topicInfo });
       break;
     }
 
@@ -94,15 +89,9 @@ function handleMessage(socket, msg) {
 }
 
 function sendTo(socket, data) {
-  if (!socket.destroyed) {
-    socket.write(JSON.stringify(data) + '\n');
-  }
+  if (!socket.destroyed) socket.write(JSON.stringify(data) + '\n');
 }
 
-server.listen(PORT, () => {
-  console.log(`[BROKER] Listening on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`[BROKER] Listening on port ${PORT}`));
 
-server.on('error', (err) => {
-  console.error(`[BROKER] Server error: ${err.message}`);
-});
+server.on('error', (err) => console.error(`[BROKER] Server error: ${err.message}`));
