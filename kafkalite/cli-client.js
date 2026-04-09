@@ -20,7 +20,15 @@ client.on('data', (chunk) => {
     buffer = buffer.slice(idx + 1);
     if (raw) {
       try {
-        console.log('[BROKER]', JSON.parse(raw));
+        const response = JSON.parse(raw);
+        if (response.records) {
+          console.log('[BROKER] topic:', response.topic, 'count:', response.count);
+          for (const record of response.records) {
+            console.log('  offset:', record.offset, 'value:', record.value);
+          }
+        } else {
+          console.log('[BROKER]', response);
+        }
       } catch {
         console.log('[BROKER] (raw):', raw);
       }
