@@ -1,11 +1,20 @@
-// broker.js — Lab 3: Multi-topic routing
+// broker.js — Lab 4: With persistent storage
 'use strict';
 
 const net = require('net');
+const storage = require('./storage');
+
 const PORT = 9092;
 
-// { topicName: [record, ...] }
-const topics = {};
+// In-memory offset counters (recovered from disk on startup)
+const topicOffsets = {}; // { topicName: nextOffset }
+
+// --- Startup: recover existing topics from disk ---
+const recovered = storage.loadAllTopics();
+for (const [topic, nextOffset] of Object.entries(recovered)) {
+  topicOffsets[topic] = nextOffset;
+}
+console.log(`[BROKER] Recovered ${Object.keys(recovered).length} topics from disk`);
 
 const server = net.createServer((socket) => {
   const clientId = `${socket.remoteAddress}:${socket.remotePort}`;
@@ -29,13 +38,13 @@ const server = net.createServer((socket) => {
   });
 
   socket.on('end', () => console.log(`[BROKER] Client disconnected: ${clientId}`));
-  socket.on('error', (err) => console.error(`[BROKER] Error [${clientId}]: ${err.message}`));
+  socket.on('error', (err) => console.error(`[BROKER] Socket error: ${err.message}`));
 });
 
 function ensureTopic(name) {
-  if (!topics[name]) {
-    topics[name] = [];
-    console.log(`[BROKER] Auto-created topic: "${name}"`);
+  if (topicOffsets[name] === undefined) {
+    topicOffsets[name] = storage.getNextOffset(name);
+    console.log(`[BROKER] Created topic: "${name}"`);
   }
 }
 
@@ -50,36 +59,37 @@ function handleMessage(socket, msg) {
       ensureTopic(topic);
 
       const record = {
-        offset: topics[topic].length,
+        offset: topicOffsets[topic]++,
         topic,
         value,
         timestamp: Date.now(),
       };
-      topics[topic].push(record);
+
+      // Write to disk BEFORE confirming to producer
+      storage.appendRecord(topic, record);
+
       console.log(`[BROKER] PUBLISH -> "${topic}" [offset ${record.offset}]`);
       sendTo(socket, { status: 'ok', offset: record.offset, topic });
       break;
     }
 
     case 'FETCH': {
+      // Pull-based fetch: reads directly from disk log
       const { topic, fromOffset = 0, maxRecords = 100 } = msg;
-      if (!topic) {
-        return sendTo(socket, { status: 'error', message: 'FETCH requires topic' });
-      }
+      if (!topic) return sendTo(socket, { status: 'error', message: 'FETCH requires topic' });
+
       ensureTopic(topic);
-      const records = topics[topic]
-        .filter(r => r.offset >= fromOffset)
-        .slice(0, maxRecords);
+      const records = storage.readRecords(topic, fromOffset).slice(0, maxRecords);
       sendTo(socket, { status: 'ok', topic, records, count: records.length });
       break;
     }
 
     case 'LIST_TOPICS': {
-      const topicInfo = Object.keys(topics).map(name => ({
+      const info = Object.keys(topicOffsets).map(name => ({
         name,
-        messageCount: topics[name].length,
+        messageCount: topicOffsets[name],
       }));
-      sendTo(socket, { status: 'ok', topics: topicInfo });
+      sendTo(socket, { status: 'ok', topics: info });
       break;
     }
 
