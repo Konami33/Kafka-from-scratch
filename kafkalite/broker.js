@@ -1,8 +1,9 @@
-// broker.js — Lab 4: With persistent storage
+// broker.js — Lab 5: With consumer offset tracking
 'use strict';
 
 const net = require('net');
 const storage = require('./storage');
+const offsetStore = require('./offsetStore');
 
 const PORT = 9092;
 
@@ -90,6 +91,33 @@ function handleMessage(socket, msg) {
         messageCount: topicOffsets[name],
       }));
       sendTo(socket, { status: 'ok', topics: info });
+      break;
+    }
+
+    case 'COMMIT_OFFSET': {
+      const { group, topic, offset, partition = 0 } = msg;
+      if (!group || !topic || offset === undefined) {
+        return sendTo(socket, { status: 'error', message: 'COMMIT_OFFSET requires group, topic, offset' });
+      }
+      offsetStore.commitOffset(group, topic, offset, partition);
+      console.log(`[BROKER] COMMIT_OFFSET group="${group}" topic="${topic}" offset=${offset}`);
+      sendTo(socket, { status: 'ok', committed: offset });
+      break;
+    }
+
+    case 'GET_OFFSET': {
+      const { group, topic, partition = 0 } = msg;
+      if (!group || !topic) {
+        return sendTo(socket, { status: 'error', message: 'GET_OFFSET requires group and topic' });
+      }
+      const committed = offsetStore.getCommittedOffset(group, topic, partition);
+      const resumeFrom = committed === -1 ? 0 : committed + 1;
+      sendTo(socket, { status: 'ok', committed, resumeFrom });
+      break;
+    }
+
+    case 'LIST_OFFSETS': {
+      sendTo(socket, { status: 'ok', offsets: offsetStore.listAllOffsets() });
       break;
     }
 
