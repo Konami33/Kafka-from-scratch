@@ -1,22 +1,25 @@
-// producer.js — Lab 3
+// producer.js — Lab 6: Key-based partitioning
 'use strict';
 
 const net = require('net');
 
 const topic = process.argv[2] || 'orders';
-const messageCount = parseInt(process.argv[3]) || 3;
+const count  = parseInt(process.argv[3]) || 9;
+const keys   = ['user-A', 'user-B', 'user-C'];
 
 const client = net.connect({ port: 9092 }, () => {
-  console.log(`[PRODUCER] Publishing ${messageCount} messages to topic "${topic}"`);
+  console.log(`[PRODUCER] Publishing ${count} messages to "${topic}" with key routing`);
 
-  for (let i = 0; i < messageCount; i++) {
+  for (let i = 0; i < count; i++) {
     setTimeout(() => {
-      const value = { id: i + 1, topic, data: `Message ${i + 1}`, ts: Date.now() };
-      client.write(JSON.stringify({ cmd: 'PUBLISH', topic, value }) + '\n');
-    }, i * 300);
+      const key   = keys[i % keys.length];
+      const value = { msgId: i + 1, key, data: `Event ${i + 1}` };
+      console.log(`[PRODUCER] key="${key}" ->`, value);
+      client.write(JSON.stringify({ cmd: 'PUBLISH', topic, key, value }) + '\n');
+    }, i * 200);
   }
 
-  setTimeout(() => client.end(), messageCount * 300 + 200);
+  setTimeout(() => client.end(), count * 200 + 300);
 });
 
 let buffer = '';
@@ -26,7 +29,10 @@ client.on('data', (chunk) => {
   while ((idx = buffer.indexOf('\n')) !== -1) {
     const raw = buffer.slice(0, idx).trim();
     buffer = buffer.slice(idx + 1);
-    if (raw) console.log('[PRODUCER] Ack:', JSON.parse(raw));
+    if (raw) {
+      const ack = JSON.parse(raw);
+      console.log(`[PRODUCER] Ack: partition=${ack.partition} offset=${ack.offset}`);
+    }
   }
 });
 

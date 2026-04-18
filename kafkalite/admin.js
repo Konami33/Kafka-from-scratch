@@ -1,4 +1,4 @@
-// admin.js — Lab 3: Inspect broker state (Labs 3–5 version)
+// admin.js — Lab 6+: Partition-aware topic listing
 'use strict';
 
 const net = require('net');
@@ -18,7 +18,10 @@ client.on('data', (chunk) => {
     const data = JSON.parse(raw);
     console.log('\n[ADMIN] Topics:');
     (data.topics || []).forEach(t => {
-      console.log(`  - ${t.name}: ${t.messageCount} messages`);
+      console.log(`  Topic: ${t.name} (${t.numPartitions} partitions)`);
+      for (let p = 0; p < t.numPartitions; p++) {
+        console.log(`    partition-${p}: offset=${t.partitionOffsets[p]}`);
+      }
     });
     client.end();
   }

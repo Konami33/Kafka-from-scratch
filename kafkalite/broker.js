@@ -1,21 +1,43 @@
-// broker.js — Lab 5: With consumer offset tracking
+// broker.js — Lab 6: Full partitioned broker
 'use strict';
 
 const net = require('net');
 const storage = require('./storage');
 const offsetStore = require('./offsetStore');
+const { assignPartition } = require('./partitioner');
 
 const PORT = 9092;
+const DEFAULT_PARTITIONS = 3;
 
-// In-memory offset counters (recovered from disk on startup)
-const topicOffsets = {}; // { topicName: nextOffset }
+// { topicName: { numPartitions, partitionOffsets: [n, n, n] } }
+const topicConfig = {};
 
-// --- Startup: recover existing topics from disk ---
-const recovered = storage.loadAllTopics();
-for (const [topic, nextOffset] of Object.entries(recovered)) {
-  topicOffsets[topic] = nextOffset;
+// Round-robin counter per topic (for keyless publishing)
+const rrCounters = {};
+
+function recoverTopics() {
+  const recovered = storage.loadAllTopics();
+  for (const topicName of Object.keys(recovered)) {
+    initTopic(topicName, DEFAULT_PARTITIONS, true);
+  }
 }
-console.log(`[BROKER] Recovered ${Object.keys(recovered).length} topics from disk`);
+
+function initTopic(name, numPartitions = DEFAULT_PARTITIONS, fromDisk = false) {
+  if (topicConfig[name]) return;
+
+  const partitionOffsets = [];
+  for (let p = 0; p < numPartitions; p++) {
+    partitionOffsets.push(fromDisk ? storage.getNextOffset(name, p) : 0);
+  }
+
+  topicConfig[name] = { numPartitions, partitionOffsets };
+  rrCounters[name] = 0;
+
+  const action = fromDisk ? 'Recovered' : 'Created';
+  console.log(`[BROKER] ${action} topic "${name}" with ${numPartitions} partitions`);
+}
+
+recoverTopics();
 
 const server = net.createServer((socket) => {
   const clientId = `${socket.remoteAddress}:${socket.remotePort}`;
@@ -31,7 +53,7 @@ const server = net.createServer((socket) => {
       buffer = buffer.slice(idx + 1);
       if (!raw) continue;
       try {
-        handleMessage(socket, JSON.parse(raw));
+        handleMessage(socket, clientId, JSON.parse(raw));
       } catch (e) {
         sendTo(socket, { status: 'error', message: 'Invalid JSON' });
       }
@@ -39,58 +61,57 @@ const server = net.createServer((socket) => {
   });
 
   socket.on('end', () => console.log(`[BROKER] Client disconnected: ${clientId}`));
-  socket.on('error', (err) => console.error(`[BROKER] Socket error: ${err.message}`));
+  socket.on('error', (err) => console.error(`[BROKER] Error: ${err.message}`));
 });
 
-function ensureTopic(name) {
-  if (topicOffsets[name] === undefined) {
-    topicOffsets[name] = storage.getNextOffset(name);
-    console.log(`[BROKER] Created topic: "${name}"`);
-  }
-}
-
-function handleMessage(socket, msg) {
+// Declared async — Lab 7 adds await inside PUBLISH for acks=all.
+// Without async, that await would be silently ignored (no error, wrong behaviour).
+async function handleMessage(socket, clientId, msg) {
   switch (msg.cmd) {
 
+    case 'CREATE_TOPIC': {
+      const { topic, numPartitions = DEFAULT_PARTITIONS } = msg;
+      if (!topic) return sendTo(socket, { status: 'error', message: 'CREATE_TOPIC requires topic' });
+      initTopic(topic, numPartitions);
+      sendTo(socket, { status: 'ok', topic, numPartitions });
+      break;
+    }
+
     case 'PUBLISH': {
-      const { topic, value } = msg;
+      const { topic, value, key } = msg;
       if (!topic || value === undefined) {
         return sendTo(socket, { status: 'error', message: 'PUBLISH requires topic and value' });
       }
-      ensureTopic(topic);
 
-      const record = {
-        offset: topicOffsets[topic]++,
-        topic,
-        value,
-        timestamp: Date.now(),
-      };
+      initTopic(topic);
 
-      // Write to disk BEFORE confirming to producer
-      storage.appendRecord(topic, record);
+      const config = topicConfig[topic];
+      const partition = assignPartition(key, config.numPartitions, rrCounters[topic]++);
+      const offset = config.partitionOffsets[partition]++;
 
-      console.log(`[BROKER] PUBLISH -> "${topic}" [offset ${record.offset}]`);
-      sendTo(socket, { status: 'ok', offset: record.offset, topic });
+      const record = { offset, partition, topic, key: key || null, value, timestamp: Date.now() };
+      storage.appendRecord(topic, record, partition);
+
+      console.log(`[BROKER] PUBLISH -> "${topic}" partition=${partition} offset=${offset} key=${key || 'null'}`);
+      sendTo(socket, { status: 'ok', topic, partition, offset });
       break;
     }
 
     case 'FETCH': {
-      // Pull-based fetch: reads directly from disk log
-      const { topic, fromOffset = 0, maxRecords = 100 } = msg;
+      const { topic, partition = 0, fromOffset = 0, maxRecords = 100, group } = msg;
       if (!topic) return sendTo(socket, { status: 'error', message: 'FETCH requires topic' });
 
-      ensureTopic(topic);
-      const records = storage.readRecords(topic, fromOffset).slice(0, maxRecords);
-      sendTo(socket, { status: 'ok', topic, records, count: records.length });
-      break;
-    }
+      initTopic(topic);
 
-    case 'LIST_TOPICS': {
-      const info = Object.keys(topicOffsets).map(name => ({
-        name,
-        messageCount: topicOffsets[name],
-      }));
-      sendTo(socket, { status: 'ok', topics: info });
+      // If group is provided and fromOffset is not, auto-resume from committed offset
+      let startOffset = fromOffset;
+      if (group && msg.fromOffset === undefined) {
+        const committed = offsetStore.getCommittedOffset(group, topic, partition);
+        startOffset = committed === -1 ? 0 : committed + 1;
+      }
+
+      const records = storage.readRecords(topic, startOffset, partition).slice(0, maxRecords);
+      sendTo(socket, { status: 'ok', topic, partition, records, count: records.length });
       break;
     }
 
@@ -100,8 +121,7 @@ function handleMessage(socket, msg) {
         return sendTo(socket, { status: 'error', message: 'COMMIT_OFFSET requires group, topic, offset' });
       }
       offsetStore.commitOffset(group, topic, offset, partition);
-      console.log(`[BROKER] COMMIT_OFFSET group="${group}" topic="${topic}" offset=${offset}`);
-      sendTo(socket, { status: 'ok', committed: offset });
+      sendTo(socket, { status: 'ok', committed: offset, partition });
       break;
     }
 
@@ -112,12 +132,17 @@ function handleMessage(socket, msg) {
       }
       const committed = offsetStore.getCommittedOffset(group, topic, partition);
       const resumeFrom = committed === -1 ? 0 : committed + 1;
-      sendTo(socket, { status: 'ok', committed, resumeFrom });
+      sendTo(socket, { status: 'ok', committed, resumeFrom, partition });
       break;
     }
 
-    case 'LIST_OFFSETS': {
-      sendTo(socket, { status: 'ok', offsets: offsetStore.listAllOffsets() });
+    case 'LIST_TOPICS': {
+      const info = Object.entries(topicConfig).map(([name, cfg]) => ({
+        name,
+        numPartitions: cfg.numPartitions,
+        partitionOffsets: cfg.partitionOffsets,
+      }));
+      sendTo(socket, { status: 'ok', topics: info });
       break;
     }
 
